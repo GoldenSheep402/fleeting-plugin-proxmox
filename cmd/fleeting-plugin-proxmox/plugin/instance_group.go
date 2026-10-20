@@ -6,7 +6,6 @@ import (
 	"slices"
 	"strconv"
 	"sync"
-	"time"
 
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/luthermonson/go-proxmox"
@@ -25,10 +24,15 @@ type InstanceGroup struct {
 	log     hclog.Logger    `json:"-"`
 	proxmox *proxmox.Client `json:"-"`
 
-	// This mutex is used when cloning template for new instances. It is required for blocking other
-	// operations like collection or update, because when new instance is created with recycled ID then for
-	// a brief period it will be reported from Proxmox with old name (e.g. InstanceNameRemoving).
+	// This mutex serializes template cloning operations so Proxmox does not
+	// fail concurrent clone tasks or allocate duplicate VMIDs.
 	instanceCloningMu sync.Mutex `json:"-"`
+
+	// Protects in-memory state tracking for instances and node scheduling counters.
+	stateMu             sync.RWMutex              `json:"-"`
+	instanceStates      map[uint64]provider.State `json:"-"`
+	collectingInstances map[uint64]struct{}       `json:"-"`
+	inFlightNodeClones  map[string]int            `json:"-"`
 
 	// Trigger for collector to start removed instances collection.
 	instanceCollectionTrigger chan struct{} `json:"-"`
@@ -52,6 +56,9 @@ func (ig *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings
 
 	ig.log = logger
 	ig.FleetingSettings = settings
+	ig.instanceStates = make(map[uint64]provider.State)
+	ig.collectingInstances = make(map[uint64]struct{})
+	ig.inFlightNodeClones = make(map[string]int)
 	ig.instanceCollectionTrigger = make(chan struct{}, triggerChannelCapacity)
 	ig.collectorShutdownTrigger = make(chan struct{}, 1)
 	ig.sessionTicketRefresherShutdownTrigger = make(chan struct{}, 1)
@@ -74,10 +81,6 @@ func (ig *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings
 	if err := ig.markStaleInstancesForRemoval(ctx); err != nil {
 		return provider.ProviderInfo{}, err
 	}
-
-	// Sleep for a bit to give Proxmox a chance to propagate renames for stale instances
-	// Without this sleep these instances would be reported as creating during first Update
-	<-time.After(collectionWaitAfterTrigger)
 
 	//nolint:contextcheck
 	ig.startRemovedInstanceCollector()
@@ -110,23 +113,17 @@ func (ig *InstanceGroup) Increase(ctx context.Context, count int) (int, error) {
 	}
 
 	var (
-		errorGroup = new(errgroup.Group)
-
+		errorGroup  = new(errgroup.Group)
 		succeeded   = 0
 		succeededMu = new(sync.Mutex)
-
-		// We need to mutex cloning as Proxmox will fail multiple requests in parallel
-		cloneMu = new(sync.Mutex)
 	)
 
-	ig.instanceCloningMu.Lock()
-	defer ig.instanceCloningMu.Unlock()
-
-	for n := 0; n < count; n++ {
+	for range count {
 		errorGroup.Go(func() error {
-			vmid, err := ig.deployInstance(ctx, template, cloneMu)
+			vmid, err := ig.deployInstance(ctx, template, &ig.instanceCloningMu)
 			if err != nil {
 				ig.log.Error("failed to deploy an instance", "vmid", vmid, "err", err)
+				return err
 			}
 
 			ig.log.Info("successfully deployed instance", "vmid", vmid)
@@ -134,7 +131,7 @@ func (ig *InstanceGroup) Increase(ctx context.Context, count int) (int, error) {
 			succeeded++
 			succeededMu.Unlock()
 
-			return err
+			return nil
 		})
 	}
 
@@ -147,34 +144,29 @@ func (ig *InstanceGroup) Increase(ctx context.Context, count int) (int, error) {
 
 // Update implements provider.InstanceGroup.
 func (ig *InstanceGroup) Update(ctx context.Context, update func(instance string, state provider.State)) error {
-	ig.instanceCloningMu.Lock()
-	defer ig.instanceCloningMu.Unlock()
-
 	pool, err := ig.getProxmoxPool(ctx)
 	if err != nil {
 		return err
 	}
+
+	seenVMIDs := make(map[uint64]struct{}, len(pool.Members))
 
 	for _, member := range pool.Members {
 		if !ig.isProxmoxResourceAnInstance(member) {
 			continue
 		}
 
-		var state provider.State
+		seenVMIDs[member.VMID] = struct{}{}
 
-		switch member.Name {
-		case ig.Settings.InstanceNameCreating:
-			state = provider.StateCreating
-		case ig.Settings.InstanceNameRunning:
-			state = provider.StateRunning
-		case ig.Settings.InstanceNameRemoving:
-			state = provider.StateDeleting
-		default:
-			continue // Unknown name, skipping...
+		state, ok := ig.resolveInstanceState(ctx, member)
+		if !ok {
+			continue
 		}
 
 		update(strconv.FormatUint(member.VMID, 10), state)
 	}
+
+	ig.cleanupDeletedInstanceStates(seenVMIDs)
 
 	return nil
 }
@@ -217,8 +209,7 @@ func (ig *InstanceGroup) Decrease(ctx context.Context, instancesToRemove []strin
 	}
 
 	var (
-		errorGroup = new(errgroup.Group)
-
+		errorGroup  = new(errgroup.Group)
 		succeeded   = []string{}
 		succeededMu = new(sync.Mutex)
 	)
@@ -234,12 +225,12 @@ func (ig *InstanceGroup) Decrease(ctx context.Context, instancesToRemove []strin
 			continue
 		}
 
-		if member.Name == ig.Settings.InstanceNameCreating {
-			// It must be running to start the deletion
+		if ig.isInstanceCreating(member) {
+			// It must finish creation before starting deletion
 			continue
 		}
 
-		if member.Name == ig.Settings.InstanceNameRemoving {
+		if ig.isInstanceDeleting(member) {
 			// Already deleting...
 			succeededMu.Lock()
 			succeeded = append(succeeded, strconv.FormatUint(member.VMID, 10))
@@ -265,4 +256,144 @@ func (ig *InstanceGroup) Decrease(ctx context.Context, instancesToRemove []strin
 
 	//nolint:wrapcheck
 	return succeeded, errorGroup.Wait()
+}
+
+func (ig *InstanceGroup) resolveInstanceState(ctx context.Context, member proxmox.ClusterResource) (provider.State, bool) {
+	if trackedState, ok := ig.getInstanceState(member.VMID); ok {
+		if trackedState == provider.StateRunning && member.Status == proxmox.StatusVirtualMachineStopped {
+			if ig.handleUnexpectedlyStoppedInstance(ctx, member) {
+				return provider.StateDeleting, true
+			}
+		}
+
+		return trackedState, true
+	}
+
+	switch member.Name {
+	case ig.Settings.InstanceNameCreating:
+		return provider.StateCreating, true
+	case ig.Settings.InstanceNameRunning:
+		if member.Status == proxmox.StatusVirtualMachineStopped {
+			if ig.handleUnexpectedlyStoppedInstance(ctx, member) {
+				return provider.StateDeleting, true
+			}
+		}
+
+		return provider.StateRunning, true
+	case ig.Settings.InstanceNameRemoving:
+		return provider.StateDeleting, true
+	default:
+		return "", false
+	}
+}
+
+func (ig *InstanceGroup) handleUnexpectedlyStoppedInstance(ctx context.Context, member proxmox.ClusterResource) bool {
+	vm, err := ig.getProxmoxVMOnNode(ctx, int(member.VMID), member.Node)
+	if err != nil || vm.Status != proxmox.StatusVirtualMachineStopped {
+		return false
+	}
+
+	ig.log.Warn("instance marked as running is stopped, marking for removal", "vmid", member.VMID, "node", member.Node)
+	memberCopy := member
+
+	if markErr := ig.markInstancesForRemoval(ctx, &memberCopy); markErr != nil {
+		ig.log.Error("failed to mark stopped instance for removal", "vmid", member.VMID, "err", markErr)
+	}
+
+	return true
+}
+
+func (ig *InstanceGroup) isInstanceCreating(member proxmox.ClusterResource) bool {
+	if state, ok := ig.getInstanceState(member.VMID); ok {
+		return state == provider.StateCreating
+	}
+
+	return member.Name == ig.Settings.InstanceNameCreating
+}
+
+func (ig *InstanceGroup) isInstanceDeleting(member proxmox.ClusterResource) bool {
+	if state, ok := ig.getInstanceState(member.VMID); ok {
+		return state == provider.StateDeleting
+	}
+
+	return member.Name == ig.Settings.InstanceNameRemoving
+}
+
+func (ig *InstanceGroup) setInstanceState(vmid uint64, state provider.State) {
+	ig.stateMu.Lock()
+	defer ig.stateMu.Unlock()
+
+	if ig.instanceStates == nil {
+		ig.instanceStates = make(map[uint64]provider.State)
+	}
+
+	ig.instanceStates[vmid] = state
+}
+
+func (ig *InstanceGroup) getInstanceState(vmid uint64) (provider.State, bool) {
+	ig.stateMu.RLock()
+	defer ig.stateMu.RUnlock()
+
+	if ig.instanceStates == nil {
+		return "", false
+	}
+
+	state, ok := ig.instanceStates[vmid]
+
+	return state, ok
+}
+
+func (ig *InstanceGroup) cleanupDeletedInstanceStates(seenVMIDs map[uint64]struct{}) {
+	ig.stateMu.Lock()
+	defer ig.stateMu.Unlock()
+
+	for vmid, state := range ig.instanceStates {
+		if _, exists := seenVMIDs[vmid]; !exists && state == provider.StateDeleting {
+			delete(ig.instanceStates, vmid)
+		}
+	}
+}
+
+func (ig *InstanceGroup) incrementInFlightClones(nodeName string) {
+	if nodeName == "" {
+		return
+	}
+
+	ig.stateMu.Lock()
+	defer ig.stateMu.Unlock()
+
+	if ig.inFlightNodeClones == nil {
+		ig.inFlightNodeClones = make(map[string]int)
+	}
+
+	ig.inFlightNodeClones[nodeName]++
+}
+
+func (ig *InstanceGroup) decrementInFlightClones(nodeName string) {
+	if nodeName == "" {
+		return
+	}
+
+	ig.stateMu.Lock()
+	defer ig.stateMu.Unlock()
+
+	if ig.inFlightNodeClones == nil {
+		return
+	}
+
+	ig.inFlightNodeClones[nodeName]--
+	if ig.inFlightNodeClones[nodeName] <= 0 {
+		delete(ig.inFlightNodeClones, nodeName)
+	}
+}
+
+func (ig *InstanceGroup) getInFlightClones(nodeName string) int {
+	ig.stateMu.RLock()
+	defer ig.stateMu.RUnlock()
+
+	if ig.inFlightNodeClones == nil {
+		return 0
+	}
+
+	return ig.inFlightNodeClones[nodeName]
 }

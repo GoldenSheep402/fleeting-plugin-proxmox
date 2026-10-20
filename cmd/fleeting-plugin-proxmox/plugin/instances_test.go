@@ -12,7 +12,7 @@ func TestInstanceGroup_templateCloneOptions(t *testing.T) {
 		name              string
 		isTemplate        bool
 		configuredStorage string
-		expectedFull      uint8
+		expectedFull      proxmox.IntOrBool
 		expectedErr       error
 	}
 
@@ -21,28 +21,28 @@ func TestInstanceGroup_templateCloneOptions(t *testing.T) {
 			name:              "VM with unconfigured storage", // Error?
 			isTemplate:        false,
 			configuredStorage: "",
-			expectedFull:      1,
+			expectedFull:      true,
 			expectedErr:       ErrCloneVMWithoutConfiguredStorage,
 		},
 		{
 			name:              "VM with configured storage",
 			isTemplate:        false,
 			configuredStorage: "local",
-			expectedFull:      1,
+			expectedFull:      true,
 			expectedErr:       nil,
 		},
 		{
 			name:              "Template with unconfigured storage",
 			isTemplate:        true,
 			configuredStorage: "",
-			expectedFull:      0,
+			expectedFull:      false,
 			expectedErr:       nil,
 		},
 		{
 			name:              "Template with configured storage",
 			isTemplate:        true,
 			configuredStorage: "local",
-			expectedFull:      1,
+			expectedFull:      true,
 			expectedErr:       nil,
 		},
 	}
@@ -66,4 +66,23 @@ func TestInstanceGroup_templateCloneOptions(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIsVMTemplate_WithVirtualMachineConfig(t *testing.T) {
+	// Even if IsTemplate unmarshalled "0" as true, VirtualMachineConfig.Template is authoritative.
+	vm := proxmox.VirtualMachine{
+		Template: proxmox.IsTemplate(true),
+		VirtualMachineConfig: &proxmox.VirtualMachineConfig{
+			Template: false,
+		},
+	}
+	require.False(t, isVMTemplate(&vm))
+
+	tpl := proxmox.VirtualMachine{
+		Template: proxmox.IsTemplate(false),
+		VirtualMachineConfig: &proxmox.VirtualMachineConfig{
+			Template: true,
+		},
+	}
+	require.True(t, isVMTemplate(&tpl))
 }

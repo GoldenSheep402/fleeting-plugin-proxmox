@@ -11,7 +11,7 @@ import (
 const (
 	collectionInterval         = 1 * time.Minute
 	collectionTimeout          = 5 * time.Minute
-	collectionWaitAfterTrigger = 10 * time.Second
+	collectionWaitAfterTrigger = 2 * time.Second
 )
 
 func (ig *InstanceGroup) startRemovedInstanceCollector() {
@@ -35,8 +35,11 @@ func (ig *InstanceGroup) runRemovedInstanceCollector() {
 		case <-ig.instanceCollectionTrigger:
 			ig.drainInstanceCollectionTriggerChannel()
 
-			// Sleep for a bit to give Proxmox a chance to propagate renames that happened before trigger
-			<-time.After(collectionWaitAfterTrigger)
+			select {
+			case <-ig.collectorShutdownTrigger:
+				return
+			case <-time.After(collectionWaitAfterTrigger):
+			}
 
 			ig.collectRemovedInstances()
 		}
@@ -47,17 +50,11 @@ func (ig *InstanceGroup) collectRemovedInstances() {
 	ctx, cancel := context.WithTimeout(context.Background(), collectionTimeout)
 	defer cancel()
 
-	ig.instanceCloningMu.Lock()
-
 	pool, err := ig.getProxmoxPool(ctx)
 	if err != nil {
 		ig.log.Error("collector failed to list instances", "err", err)
-		ig.instanceCloningMu.Unlock()
-
 		return
 	}
-
-	ig.instanceCloningMu.Unlock()
 
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -67,7 +64,11 @@ func (ig *InstanceGroup) collectRemovedInstances() {
 			continue
 		}
 
-		if member.Name != ig.Settings.InstanceNameRemoving {
+		if !ig.isInstanceDeleting(member) {
+			continue
+		}
+
+		if !ig.tryStartCollecting(member.VMID) {
 			continue
 		}
 
@@ -77,6 +78,7 @@ func (ig *InstanceGroup) collectRemovedInstances() {
 
 		go func(member proxmox.ClusterResource) {
 			defer wg.Done()
+			defer ig.finishCollecting(member.VMID)
 			ig.collectInstance(ctx, member)
 		}(member)
 	}
@@ -89,10 +91,10 @@ func (ig *InstanceGroup) collectInstance(ctx context.Context, member proxmox.Clu
 		return
 	}
 
-	if vm.Status == "running" {
+	if vm.Status == proxmox.StatusVirtualMachineRunning {
 		task, err := vm.Stop(ctx)
 		if err == nil {
-			err = task.Wait(ctx, proxmoxTaskWaitInterval, collectionTimeout)
+			err = waitForProxmoxTask(ctx, task, proxmoxTaskWaitInterval, collectionTimeout)
 		}
 
 		if err != nil {
@@ -101,14 +103,41 @@ func (ig *InstanceGroup) collectInstance(ctx context.Context, member proxmox.Clu
 		}
 	}
 
-	task, err := vm.Delete(ctx)
+	task, err := vm.Delete(ctx, &proxmox.VirtualMachineDeleteOptions{
+		DestroyUnreferencedDisks: true,
+		Purge:                    true,
+	})
 	if err == nil {
-		err = task.Wait(ctx, proxmoxTaskWaitInterval, collectionTimeout)
+		err = waitForProxmoxTask(ctx, task, proxmoxTaskWaitInterval, collectionTimeout)
 	}
 
 	if err != nil {
 		ig.log.Error("collector failed to delete instance", "vmid", member.VMID, "err", err)
 	}
+}
+
+func (ig *InstanceGroup) tryStartCollecting(vmid uint64) bool {
+	ig.stateMu.Lock()
+	defer ig.stateMu.Unlock()
+
+	if ig.collectingInstances == nil {
+		ig.collectingInstances = make(map[uint64]struct{})
+	}
+
+	if _, exists := ig.collectingInstances[vmid]; exists {
+		return false
+	}
+
+	ig.collectingInstances[vmid] = struct{}{}
+
+	return true
+}
+
+func (ig *InstanceGroup) finishCollecting(vmid uint64) {
+	ig.stateMu.Lock()
+	defer ig.stateMu.Unlock()
+
+	delete(ig.collectingInstances, vmid)
 }
 
 func (ig *InstanceGroup) drainInstanceCollectionTriggerChannel() {

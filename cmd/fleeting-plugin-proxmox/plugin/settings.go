@@ -93,10 +93,6 @@ func (s *Settings) FillWithDefaults() {
 	if s.InstanceNameRemoving == "" {
 		s.InstanceNameRemoving = DefaultInstanceNameRemoving
 	}
-
-	if s.InstanceNetworkProtocol == "" {
-		s.InstanceNetworkProtocol = DefaultInstanceNetworkProtocol
-	}
 }
 
 func (s *Settings) CheckRequiredFields() error {

@@ -7,7 +7,7 @@ import (
 
 const (
 	sessionTicketRefreshInterval = 1 * time.Hour
-	sessionTicketRefreshTimeout  = 5 * time.Second
+	sessionTicketRefreshTimeout  = 15 * time.Second
 )
 
 func (ig *InstanceGroup) startSessionTicketRefresher() {
@@ -25,23 +25,30 @@ func (ig *InstanceGroup) runSessionTicketRefresher() {
 		case <-ig.sessionTicketRefresherShutdownTrigger:
 			return
 		case <-time.After(sessionTicketRefreshInterval):
-			func() {
-				ctx, cancel := context.WithTimeout(context.Background(), sessionTicketRefreshTimeout)
-				defer cancel()
-
-				credentials, err := ig.getProxmoxCredentials()
-				if err != nil {
-					ig.log.Error("failed to refresh proxmox session, could not read credentials", "err", err)
-					return
-				}
-
-				_, err = ig.proxmox.Ticket(ctx, credentials)
-				if err != nil {
-					ig.log.Error("failed to refresh proxmox session", "err", err)
-				}
-
-				ig.log.Info("refreshed proxmox session")
-			}()
+			ig.refreshProxmoxSession()
 		}
 	}
+}
+
+func (ig *InstanceGroup) refreshProxmoxSession() {
+	ctx, cancel := context.WithTimeout(context.Background(), sessionTicketRefreshTimeout)
+	defer cancel()
+
+	if err := ig.proxmox.RefreshTicket(ctx); err == nil {
+		ig.log.Info("refreshed proxmox session")
+		return
+	}
+
+	credentials, err := ig.getProxmoxCredentials()
+	if err != nil {
+		ig.log.Error("failed to refresh proxmox session, could not read credentials", "err", err)
+		return
+	}
+
+	if _, err := ig.proxmox.Ticket(ctx, credentials); err != nil {
+		ig.log.Error("failed to refresh proxmox session", "err", err)
+		return
+	}
+
+	ig.log.Info("refreshed proxmox session")
 }
