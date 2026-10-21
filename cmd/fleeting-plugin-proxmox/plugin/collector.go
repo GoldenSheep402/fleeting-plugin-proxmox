@@ -94,7 +94,7 @@ func (ig *InstanceGroup) collectInstance(ctx context.Context, member proxmox.Clu
 	if vm.Status == proxmox.StatusVirtualMachineRunning {
 		task, err := vm.Stop(ctx)
 		if err == nil {
-			err = waitForProxmoxTask(ctx, task, proxmoxTaskWaitInterval, collectionTimeout)
+			err = waitForProxmoxTask(ctx, task, ig.taskWaitInterval(), collectionTimeout)
 		}
 
 		if err != nil {
@@ -108,7 +108,7 @@ func (ig *InstanceGroup) collectInstance(ctx context.Context, member proxmox.Clu
 		Purge:                    true,
 	})
 	if err == nil {
-		err = waitForProxmoxTask(ctx, task, proxmoxTaskWaitInterval, collectionTimeout)
+		err = waitForProxmoxTask(ctx, task, ig.taskWaitInterval(), collectionTimeout)
 	}
 
 	if err != nil {

@@ -32,6 +32,8 @@ const (
 	DefaultInstanceNameCreating = "fleeting-creating"
 	DefaultInstanceNameRunning  = "fleeting-running"
 	DefaultInstanceNameRemoving = "fleeting-removing"
+
+	DefaultProxmoxTaskWaitInterval = 1
 )
 
 // Plguin settings.
@@ -71,6 +73,18 @@ type Settings struct {
 
 	// Name to set for instances during removal.
 	InstanceNameRemoving string `json:"instance_name_removing"`
+
+	// Tags to set for instances during creation, semicolon delimited.
+	InstanceTagsCreating string `json:"instance_tags_creating"`
+
+	// Tags to set for running instances, semicolon delimited.
+	InstanceTagsRunning string `json:"instance_tags_running"`
+
+	// Tags to set for instances during removal, semicolon delimited.
+	InstanceTagsRemoving string `json:"instance_tags_removing"`
+
+	// How often (in seconds) task status should be queried.
+	ProxmoxTaskWaitInterval *int `json:"proxmox_task_wait_interval,omitempty"`
 }
 
 func (s *Settings) FillWithDefaults() {
@@ -92,6 +106,11 @@ func (s *Settings) FillWithDefaults() {
 
 	if s.InstanceNameRemoving == "" {
 		s.InstanceNameRemoving = DefaultInstanceNameRemoving
+	}
+
+	if s.ProxmoxTaskWaitInterval == nil || *s.ProxmoxTaskWaitInterval <= 0 {
+		interval := DefaultProxmoxTaskWaitInterval
+		s.ProxmoxTaskWaitInterval = &interval
 	}
 }
 

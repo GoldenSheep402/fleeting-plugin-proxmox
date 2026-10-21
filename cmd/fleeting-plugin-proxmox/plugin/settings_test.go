@@ -31,17 +31,24 @@ func TestSettings_fillWithDefaults(t *testing.T) {
 	require.Equal(t, "fleeting-removing", settings.InstanceNameRemoving)
 	require.Equal(t, "ens18", settings.InstanceNetworkInterface)
 	require.Equal(t, "ipv4", settings.InstanceNetworkProtocol)
+	require.NotNil(t, settings.ProxmoxTaskWaitInterval)
+	require.Equal(t, 1, *settings.ProxmoxTaskWaitInterval)
 
+	customInterval := 3
 	settings2 := Settings{
-		InstanceNameCreating: sampleInstanceNameCreating,
-		InstanceNameRunning:  sampleInstanceNameRunning,
-		InstanceNameRemoving: sampleInstanceNameRemoving,
+		InstanceNameCreating:    sampleInstanceNameCreating,
+		InstanceNameRunning:     sampleInstanceNameRunning,
+		InstanceNameRemoving:    sampleInstanceNameRemoving,
+		InstanceTagsRunning:     "gitlab-runner",
+		ProxmoxTaskWaitInterval: &customInterval,
 	}
 	settings2.FillWithDefaults()
 
 	require.Equal(t, sampleInstanceNameCreating, settings2.InstanceNameCreating)
 	require.Equal(t, sampleInstanceNameRunning, settings2.InstanceNameRunning)
 	require.Equal(t, sampleInstanceNameRemoving, settings2.InstanceNameRemoving)
+	require.Equal(t, "gitlab-runner", settings2.InstanceTagsRunning)
+	require.Equal(t, 3, *settings2.ProxmoxTaskWaitInterval)
 }
 
 func TestSettings_checkRequiredFields(t *testing.T) {

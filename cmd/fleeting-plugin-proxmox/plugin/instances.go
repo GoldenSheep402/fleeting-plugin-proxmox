@@ -36,6 +36,12 @@ func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.V
 		return VMID, fmt.Errorf("failed to find newly deployed instance vmid='%d': %w", VMID, err)
 	}
 
+	if ig.Settings.InstanceTagsCreating != "" {
+		if err := ig.configureVMNameAndTags(ctx, vm, "", ig.Settings.InstanceTagsCreating, false); err != nil {
+			ig.log.Warn("failed to set creating tags on instance", "vmid", VMID, "err", err)
+		}
+	}
+
 	if err := ig.startAndConfigureInstance(ctx, vm); err != nil {
 		ig.log.Error("instance deployment failed, marking for removal", "vmid", VMID, "err", err)
 		ig.markFailedVMForRemoval(vm, VMID)
@@ -43,13 +49,8 @@ func (ig *InstanceGroup) deployInstance(ctx context.Context, template *proxmox.V
 		return VMID, fmt.Errorf("failed to configure instance, marked for removal due to: %w", err)
 	}
 
-	renameTask, renameErr := vm.Config(ctx, proxmox.VirtualMachineOption{
-		Name:  "name",
-		Value: ig.Settings.InstanceNameRunning,
-	})
-	if renameErr == nil {
-		renameErr = waitForProxmoxTask(ctx, renameTask, proxmoxTaskWaitInterval, proxmoxTaskWaitTimeout)
-	}
+	applyRunningTags := ig.Settings.InstanceTagsRunning != "" || ig.Settings.InstanceTagsCreating != ""
+	renameErr := ig.configureVMNameAndTags(ctx, vm, ig.Settings.InstanceNameRunning, ig.Settings.InstanceTagsRunning, applyRunningTags)
 
 	if renameErr != nil {
 		ig.log.Error("failed to rename instance to running, marking for removal", "vmid", VMID, "err", renameErr)
@@ -77,7 +78,7 @@ func (ig *InstanceGroup) findDeployedVM(ctx context.Context, vmid int, targetNod
 func (ig *InstanceGroup) startAndConfigureInstance(ctx context.Context, vm *proxmox.VirtualMachine) error {
 	task, err := vm.Start(ctx)
 	if err == nil {
-		err = waitForProxmoxTask(ctx, task, proxmoxTaskWaitInterval, proxmoxTaskWaitTimeout)
+		err = waitForProxmoxTask(ctx, task, ig.taskWaitInterval(), proxmoxTaskWaitTimeout)
 	}
 
 	if err != nil {
@@ -95,7 +96,7 @@ func (ig *InstanceGroup) waitForInstanceReady(ctx context.Context, vm *proxmox.V
 	waitCtx, cancel := context.WithTimeout(ctx, proxmoxAgentStartTimeout)
 	defer cancel()
 
-	ticker := time.NewTicker(proxmoxTaskWaitInterval)
+	ticker := time.NewTicker(ig.taskWaitInterval())
 	defer ticker.Stop()
 
 	var lastErr error
@@ -133,13 +134,8 @@ func (ig *InstanceGroup) markFailedVMForRemoval(vm *proxmox.VirtualMachine, vmid
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), proxmoxTaskWaitTimeout)
 	defer cancel()
 
-	renameTask, renameErr := vm.Config(cleanupCtx, proxmox.VirtualMachineOption{
-		Name:  "name",
-		Value: ig.Settings.InstanceNameRemoving,
-	})
-	if renameErr == nil {
-		renameErr = waitForProxmoxTask(cleanupCtx, renameTask, proxmoxTaskWaitInterval, proxmoxTaskWaitTimeout)
-	}
+	applyRemovingTags := ig.Settings.InstanceTagsRemoving != "" || ig.Settings.InstanceTagsCreating != "" || ig.Settings.InstanceTagsRunning != ""
+	renameErr := ig.configureVMNameAndTags(cleanupCtx, vm, ig.Settings.InstanceNameRemoving, ig.Settings.InstanceTagsRemoving, applyRemovingTags)
 
 	if renameErr != nil {
 		ig.log.Error("failed to rename failed instance for removal", "vmid", vmid, "err", renameErr)
@@ -181,7 +177,7 @@ func (ig *InstanceGroup) cloneTemplate(ctx context.Context, template *proxmox.Vi
 	ig.setInstanceState(uint64(VMID), provider.StateCreating)
 	ig.incrementInFlightClones(targetNode)
 
-	if err := waitForProxmoxTask(ctx, task, proxmoxTaskWaitInterval, proxmoxTaskWaitTimeout); err != nil {
+	if err := waitForProxmoxTask(ctx, task, ig.taskWaitInterval(), proxmoxTaskWaitTimeout); err != nil {
 		ig.decrementInFlightClones(targetNode)
 		ig.setInstanceState(uint64(VMID), provider.StateDeleting)
 		ig.triggerInstanceCollection()
@@ -270,14 +266,8 @@ func (ig *InstanceGroup) markInstancesForRemoval(ctx context.Context, instances 
 				return fmt.Errorf("failed to mark instance for removal: %w", err)
 			}
 
-			task, err := vm.Config(ctx, proxmox.VirtualMachineOption{
-				Name:  "name",
-				Value: ig.Settings.InstanceNameRemoving,
-			})
-
-			if err == nil {
-				err = waitForProxmoxTask(ctx, task, proxmoxTaskWaitInterval, proxmoxTaskWaitTimeout)
-			}
+			applyRemovingTags := ig.Settings.InstanceTagsRemoving != "" || ig.Settings.InstanceTagsCreating != "" || ig.Settings.InstanceTagsRunning != ""
+			err = ig.configureVMNameAndTags(ctx, vm, ig.Settings.InstanceNameRemoving, ig.Settings.InstanceTagsRemoving, applyRemovingTags)
 
 			if err != nil {
 				log.Error("Failed to mark instance for removal", "err", err)

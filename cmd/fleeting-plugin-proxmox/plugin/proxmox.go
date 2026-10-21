@@ -66,6 +66,42 @@ func (ig *InstanceGroup) getProxmoxVMOnNode(ctx context.Context, vmid int, nodeN
 	return vm, nil
 }
 
+func (ig *InstanceGroup) taskWaitInterval() time.Duration {
+	if ig.Settings.ProxmoxTaskWaitInterval != nil && *ig.Settings.ProxmoxTaskWaitInterval > 0 {
+		return time.Duration(*ig.Settings.ProxmoxTaskWaitInterval) * time.Second
+	}
+
+	return proxmoxTaskWaitInterval
+}
+
+func (ig *InstanceGroup) configureVMNameAndTags(ctx context.Context, vm *proxmox.VirtualMachine, name, tags string, applyEmptyTags bool) error {
+	options := make([]proxmox.VirtualMachineOption, 0, 2)
+	if name != "" {
+		options = append(options, proxmox.VirtualMachineOption{
+			Name:  "name",
+			Value: name,
+		})
+	}
+
+	if tags != "" || applyEmptyTags {
+		options = append(options, proxmox.VirtualMachineOption{
+			Name:  "tags",
+			Value: tags,
+		})
+	}
+
+	if len(options) == 0 {
+		return nil
+	}
+
+	task, err := vm.Config(ctx, options...)
+	if err == nil {
+		err = waitForProxmoxTask(ctx, task, ig.taskWaitInterval(), proxmoxTaskWaitTimeout)
+	}
+
+	return err
+}
+
 func waitForProxmoxTask(ctx context.Context, task *proxmox.Task, interval, timeout time.Duration) error {
 	if task == nil {
 		return nil
