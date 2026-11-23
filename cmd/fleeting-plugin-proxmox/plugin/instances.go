@@ -218,29 +218,70 @@ func (ig *InstanceGroup) cloneTemplate(ctx context.Context, template *proxmox.Vi
 	}
 	defer ig.releaseCloneSlot()
 
-	VMID, targetNode, task, err := ig.allocateAndStartCloneTask(ctx, template, cloneOptions, cloneMu)
-	if err != nil {
-		return -1, "", err
-	}
+	delay := cloneRetryBaseDelay
 
-	if err := waitForProxmoxTask(ctx, task, ig.taskWaitInterval(), ig.taskWaitTimeout()); err != nil {
-		ig.decrementInFlightClones(targetNode)
-		ig.unmarkActiveDeploy(uint64(VMID))
-		ig.setInstanceState(uint64(VMID), provider.StateDeleting)
-
-		findCtx, findCancel := context.WithTimeout(ig.lifecycleContext(), ig.httpTimeout())
-		vm, findErr := ig.findDeployedVM(findCtx, VMID, targetNode)
-		findCancel()
-		if findErr == nil {
-			ig.markFailedVMForRemoval(vm, VMID)
-		} else {
-			ig.triggerInstanceCollection()
+	for attempt := 0; attempt < cloneAllocateMaxAttempts; attempt++ {
+		VMID, targetNode, task, err := ig.allocateAndStartCloneTask(ctx, template, cloneOptions, cloneMu)
+		if err != nil {
+			return -1, "", err
 		}
 
-		return VMID, targetNode, fmt.Errorf("failed waiting for clone task: %w", err)
+		waitErr := waitForProxmoxTask(ctx, task, ig.taskWaitInterval(), ig.taskWaitTimeout())
+		if waitErr == nil {
+			return VMID, targetNode, nil
+		}
+
+		ig.decrementInFlightClones(targetNode)
+		ig.unmarkActiveDeploy(uint64(VMID))
+
+		if isDuplicateVMIDError(waitErr) && attempt < cloneAllocateMaxAttempts-1 {
+			ig.deleteInstanceState(uint64(VMID))
+			ig.logWarn("clone task hit duplicate VMID allocated concurrently, retrying", "vmid", VMID, "node", targetNode, "attempt", attempt+1, "err", waitErr)
+
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return VMID, targetNode, fmt.Errorf("failed waiting for clone task: %w", waitErr)
+			case <-timer.C:
+			}
+
+			delay *= 2
+			continue
+		}
+
+		ig.cleanupFailedCloneTask(VMID, targetNode, waitErr)
+
+		return VMID, targetNode, fmt.Errorf("failed waiting for clone task: %w", waitErr)
 	}
 
-	return VMID, targetNode, nil
+	return -1, "", errors.New("failed to clone template after maximum duplicate VMID retries")
+}
+
+func (ig *InstanceGroup) cleanupFailedCloneTask(vmid int, targetNode string, waitErr error) {
+	if isDuplicateVMIDError(waitErr) {
+		// Never delete a pre-existing VM owned by another runner or process.
+		ig.deleteInstanceState(uint64(vmid))
+		return
+	}
+
+	findCtx, findCancel := context.WithTimeout(ig.lifecycleContext(), ig.httpTimeout())
+	vm, findErr := ig.findDeployedVM(findCtx, vmid, targetNode)
+	findCancel()
+
+	if findErr != nil {
+		ig.deleteInstanceState(uint64(vmid))
+		return
+	}
+
+	if vm.Name != "" && !matchesInstanceName(vm.Name, ig.Settings.InstanceNameCreating, uint64(vmid)) {
+		ig.logWarn("skipping removal of failed clone VMID with foreign name", "vmid", vmid, "name", vm.Name)
+		ig.deleteInstanceState(uint64(vmid))
+
+		return
+	}
+
+	ig.markFailedVMForRemoval(vm, vmid)
 }
 
 func (ig *InstanceGroup) allocateAndStartCloneTask(

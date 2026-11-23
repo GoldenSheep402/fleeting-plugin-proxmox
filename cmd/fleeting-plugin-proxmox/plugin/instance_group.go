@@ -463,6 +463,19 @@ func (ig *InstanceGroup) getInstanceState(vmid uint64) (provider.State, bool) {
 	return entry.state, ok
 }
 
+func (ig *InstanceGroup) deleteInstanceState(vmid uint64) {
+	ig.stateMu.Lock()
+	defer ig.stateMu.Unlock()
+
+	if ig.instanceStates != nil {
+		delete(ig.instanceStates, vmid)
+	}
+
+	if ig.staleCreatingSeen != nil {
+		delete(ig.staleCreatingSeen, vmid)
+	}
+}
+
 func (ig *InstanceGroup) markActiveDeploy(vmid uint64) {
 	if vmid == 0 {
 		return

@@ -13,6 +13,7 @@ import (
 
 	"github.com/luthermonson/go-proxmox"
 	"github.com/stretchr/testify/require"
+	"gitlab.com/gitlab-org/fleeting/fleeting/provider"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -287,4 +288,100 @@ func TestInstanceGroup_cloneTemplate_NodeFallback(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 201, vmid)
 	require.Equal(t, "pve1", node)
+}
+
+func TestInstanceGroup_cloneTemplate_AsyncDuplicateVMIDRetriesWithoutDeleting(t *testing.T) {
+	ctx := context.Background()
+
+	var (
+		nextIDCalls     atomic.Int32
+		touchedVM118    atomic.Bool
+		collectionFired atomic.Bool
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, req *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch req.URL.Path {
+		case "/api2/json/nodes/pve1/qemu/9000/status/current":
+			_, _ = writer.Write([]byte(`{"data":{"vmid":9000,"name":"ci-tpl","status":"stopped","template":1,"maxmem":2147483648}}`))
+		case "/api2/json/nodes/pve1/qemu/9000/config":
+			_, _ = writer.Write([]byte(`{"data":{"template":1,"memory":"2048"}}`))
+		case "/api2/json/nodes/pve1/qemu/9000/feature":
+			_, _ = writer.Write([]byte(`{"data":{"hasFeature":true,"nodes":["pve1"]}}`))
+		case "/api2/json/nodes":
+			_, _ = writer.Write([]byte(`{"data":[{"node":"pve1","status":"online","mem":2147483648,"maxmem":17179869184,"cpu":0.1}]}`))
+		case "/api2/json/cluster/status":
+			_, _ = writer.Write([]byte(`{"data":[]}`))
+		case "/api2/json/cluster/nextid":
+			call := nextIDCalls.Add(1)
+			if call == 1 {
+				_, _ = writer.Write([]byte(`{"data":"118"}`))
+				return
+			}
+			_, _ = writer.Write([]byte(`{"data":"119"}`))
+		case "/api2/json/nodes/pve1/qemu/9000/clone":
+			body, err := io.ReadAll(req.Body)
+			require.NoError(t, err)
+			var payload map[string]any
+			require.NoError(t, json.Unmarshal(body, &payload))
+			if int(payload["newid"].(float64)) == 118 {
+				_, _ = writer.Write([]byte(`{"data":"UPID:pve1:00001234:00005678:65000001:qmclone:9000:root@pam:"}`))
+				return
+			}
+			_, _ = writer.Write([]byte(`{"data":"UPID:pve1:00001234:00005678:65000002:qmclone:9000:root@pam:"}`))
+		case "/api2/json/nodes/pve1/tasks/UPID:pve1:00001234:00005678:65000001:qmclone:9000:root@pam:/status":
+			_, _ = writer.Write([]byte(`{"data":{"status":"stopped","exitstatus":"VM 118 already exists on node 'epyc'"}}`))
+		case "/api2/json/nodes/pve1/tasks/UPID:pve1:00001234:00005678:65000002:qmclone:9000:root@pam:/status":
+			_, _ = writer.Write([]byte(`{"data":{"status":"stopped","exitstatus":"OK"}}`))
+		case "/api2/json/nodes/pve1/qemu/118",
+			"/api2/json/nodes/pve1/qemu/118/config",
+			"/api2/json/nodes/pve1/qemu/118/status/current",
+			"/api2/json/nodes/pve1/qemu/118/status/stop":
+			touchedVM118.Store(true)
+			writer.WriteHeader(http.StatusInternalServerError)
+		default:
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := proxmox.NewClient(server.URL + "/api2/json")
+	template, err := (&proxmox.Node{}).New(client, "pve1").VirtualMachine(ctx, 9000)
+	require.NoError(t, err)
+
+	taskWaitInterval := 1
+	ig := InstanceGroup{
+		proxmox:                   client,
+		instanceCollectionTrigger: make(chan struct{}, 1),
+		Settings: Settings{
+			Pool:                    "ci-pool",
+			Storage:                 "local-lvm",
+			InstanceNameCreating:    DefaultInstanceNameCreating,
+			ProxmoxTaskWaitInterval: &taskWaitInterval,
+		},
+	}
+
+	var cloneMu sync.Mutex
+	vmid, node, err := ig.cloneTemplate(ctx, template, &cloneMu)
+	require.NoError(t, err)
+	require.Equal(t, 119, vmid)
+	require.Equal(t, "pve1", node)
+
+	// Must never touch or trigger collection for pre-existing foreign VM 118.
+	require.False(t, touchedVM118.Load())
+	select {
+	case <-ig.instanceCollectionTrigger:
+		collectionFired.Store(true)
+	default:
+	}
+	require.False(t, collectionFired.Load())
+
+	_, has118State := ig.getInstanceState(118)
+	require.False(t, has118State)
+	require.False(t, ig.isActiveDeploy(118))
+
+	state119, has119State := ig.getInstanceState(119)
+	require.True(t, has119State)
+	require.Equal(t, provider.StateCreating, state119)
+	require.Equal(t, 1, ig.getInFlightClones("pve1"))
 }
