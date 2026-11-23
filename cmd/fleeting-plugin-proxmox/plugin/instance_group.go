@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"time"
 
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/luthermonson/go-proxmox"
@@ -17,6 +18,11 @@ var _ provider.InstanceGroup = (*InstanceGroup)(nil)
 
 const triggerChannelCapacity = 100
 
+type trackedInstanceState struct {
+	state     provider.State
+	updatedAt time.Time
+}
+
 type InstanceGroup struct {
 	Settings         `json:",inline"`
 	FleetingSettings provider.Settings `json:"-"`
@@ -24,15 +30,27 @@ type InstanceGroup struct {
 	log     hclog.Logger    `json:"-"`
 	proxmox *proxmox.Client `json:"-"`
 
-	// This mutex serializes template cloning operations so Proxmox does not
-	// fail concurrent clone tasks or allocate duplicate VMIDs.
-	instanceCloningMu sync.Mutex `json:"-"`
+	clientMu        sync.RWMutex      `json:"-"`
+	proxmoxClients  []*proxmox.Client `json:"-"`
+	proxmoxURLs     []string          `json:"-"`
+	activeClientIdx int               `json:"-"`
+	useAPIToken     bool              `json:"-"`
+
+	baseCtx    context.Context    `json:"-"`
+	baseCancel context.CancelFunc `json:"-"`
+
+	// This mutex serializes the clone allocation critical section so Proxmox
+	// does not allocate duplicate VMIDs or race on per-node in-flight counts.
+	instanceCloningMu sync.Mutex    `json:"-"`
+	cloneSem          chan struct{} `json:"-"`
 
 	// Protects in-memory state tracking for instances and node scheduling counters.
-	stateMu             sync.RWMutex              `json:"-"`
-	instanceStates      map[uint64]provider.State `json:"-"`
-	collectingInstances map[uint64]struct{}       `json:"-"`
-	inFlightNodeClones  map[string]int            `json:"-"`
+	stateMu             sync.RWMutex                    `json:"-"`
+	instanceStates      map[uint64]trackedInstanceState `json:"-"`
+	collectingInstances map[uint64]struct{}             `json:"-"`
+	inFlightNodeClones  map[string]int                  `json:"-"`
+	activeDeploys       map[uint64]struct{}             `json:"-"`
+	staleCreatingSeen   map[uint64]time.Time            `json:"-"`
 
 	// Trigger for collector to start removed instances collection.
 	instanceCollectionTrigger chan struct{} `json:"-"`
@@ -52,13 +70,14 @@ type InstanceGroup struct {
 
 // Init implements provider.InstanceGroup.
 func (ig *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings provider.Settings) (provider.ProviderInfo, error) {
-	var err error
-
 	ig.log = logger
 	ig.FleetingSettings = settings
-	ig.instanceStates = make(map[uint64]provider.State)
+	ig.baseCtx, ig.baseCancel = context.WithCancel(context.Background())
+	ig.instanceStates = make(map[uint64]trackedInstanceState)
 	ig.collectingInstances = make(map[uint64]struct{})
 	ig.inFlightNodeClones = make(map[string]int)
+	ig.activeDeploys = make(map[uint64]struct{})
+	ig.staleCreatingSeen = make(map[uint64]time.Time)
 	ig.instanceCollectionTrigger = make(chan struct{}, triggerChannelCapacity)
 	ig.collectorShutdownTrigger = make(chan struct{}, 1)
 	ig.sessionTicketRefresherShutdownTrigger = make(chan struct{}, 1)
@@ -68,13 +87,13 @@ func (ig *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings
 	}
 
 	ig.Settings.FillWithDefaults()
+	ig.cloneSem = make(chan struct{}, *ig.Settings.MaxConcurrentClones)
 
 	if ig.Settings.InsecureSkipTLSVerify {
-		ig.log.Warn("TLS verification for Proxmox client is disabled, connections will be insecure")
+		ig.logWarn("TLS verification for Proxmox client is disabled, connections will be insecure")
 	}
 
-	ig.proxmox, err = ig.getProxmoxClient()
-	if err != nil {
+	if err := ig.initProxmoxClients(); err != nil {
 		return provider.ProviderInfo{}, err
 	}
 
@@ -85,8 +104,12 @@ func (ig *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings
 	//nolint:contextcheck
 	ig.startRemovedInstanceCollector()
 
-	//nolint:contextcheck
-	ig.startSessionTicketRefresher()
+	if ig.useAPIToken {
+		ig.logInfo("using proxmox API token authentication, skipping session ticket refresher")
+	} else {
+		//nolint:contextcheck
+		ig.startSessionTicketRefresher()
+	}
 
 	return provider.ProviderInfo{
 		ID:      ig.Settings.Pool,
@@ -95,18 +118,51 @@ func (ig *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings
 }
 
 // Shutdown implements provider.InstanceGroup.
-func (ig *InstanceGroup) Shutdown(_ context.Context) error {
-	ig.collectorShutdownTrigger <- struct{}{}
-	ig.sessionTicketRefresherShutdownTrigger <- struct{}{}
+func (ig *InstanceGroup) Shutdown(ctx context.Context) error {
+	if ig.baseCancel != nil {
+		ig.baseCancel()
+	}
 
-	ig.collectorWaitGroup.Wait()
-	ig.sessionTicketRefresherWaitGroup.Wait()
+	if ig.collectorShutdownTrigger != nil {
+		select {
+		case ig.collectorShutdownTrigger <- struct{}{}:
+		default:
+		}
+	}
 
-	return nil
+	if ig.sessionTicketRefresherShutdownTrigger != nil {
+		select {
+		case ig.sessionTicketRefresherShutdownTrigger <- struct{}{}:
+		default:
+		}
+	}
+
+	doneCh := make(chan struct{})
+	go func() {
+		ig.collectorWaitGroup.Wait()
+		ig.sessionTicketRefresherWaitGroup.Wait()
+		close(doneCh)
+	}()
+
+	if ctx == nil {
+		<-doneCh
+		return nil
+	}
+
+	select {
+	case <-doneCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Increase implements provider.InstanceGroup.
 func (ig *InstanceGroup) Increase(ctx context.Context, count int) (int, error) {
+	if count <= 0 {
+		return 0, nil
+	}
+
 	template, err := ig.getProxmoxVM(ctx, *ig.Settings.TemplateID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to find template with id='%d': %w", *ig.Settings.TemplateID, err)
@@ -122,11 +178,11 @@ func (ig *InstanceGroup) Increase(ctx context.Context, count int) (int, error) {
 		errorGroup.Go(func() error {
 			vmid, err := ig.deployInstance(ctx, template, &ig.instanceCloningMu)
 			if err != nil {
-				ig.log.Error("failed to deploy an instance", "vmid", vmid, "err", err)
+				ig.logError("failed to deploy an instance", "vmid", vmid, "err", err)
 				return err
 			}
 
-			ig.log.Info("successfully deployed instance", "vmid", vmid)
+			ig.logInfo("successfully deployed instance", "vmid", vmid)
 			succeededMu.Lock()
 			succeeded++
 			succeededMu.Unlock()
@@ -203,6 +259,10 @@ func (ig *InstanceGroup) ConnectInfo(ctx context.Context, instance string) (prov
 
 // Decrease implements provider.InstanceGroup.
 func (ig *InstanceGroup) Decrease(ctx context.Context, instancesToRemove []string) ([]string, error) {
+	if len(instancesToRemove) == 0 {
+		return []string{}, nil
+	}
+
 	pool, err := ig.getProxmoxPool(ctx)
 	if err != nil {
 		return []string{}, err
@@ -239,7 +299,7 @@ func (ig *InstanceGroup) Decrease(ctx context.Context, instancesToRemove []strin
 			continue
 		}
 
-		ig.log.Info("removing instance", "vmid", member.VMID)
+		ig.logInfo("removing instance", "vmid", member.VMID)
 
 		errorGroup.Go(func() error {
 			if err := ig.markInstancesForRemoval(ctx, &member); err != nil {
@@ -258,6 +318,59 @@ func (ig *InstanceGroup) Decrease(ctx context.Context, instancesToRemove []strin
 	return succeeded, errorGroup.Wait()
 }
 
+func (ig *InstanceGroup) lifecycleContext() context.Context {
+	if ig.baseCtx != nil {
+		return ig.baseCtx
+	}
+
+	return context.Background()
+}
+
+func (ig *InstanceGroup) instanceNameForState(baseName string, vmid int) string {
+	if baseName == "" || !ig.Settings.InstanceNameIncludeVMID || vmid <= 0 {
+		return baseName
+	}
+
+	return fmt.Sprintf("%s-%d", baseName, vmid)
+}
+
+func matchesInstanceName(memberName, configuredName string, vmid uint64) bool {
+	if configuredName == "" {
+		return false
+	}
+
+	if memberName == configuredName {
+		return true
+	}
+
+	return memberName == fmt.Sprintf("%s-%d", configuredName, vmid)
+}
+
+func (ig *InstanceGroup) matchInstanceStateByName(member proxmox.ClusterResource) (provider.State, bool) {
+	switch member.Name {
+	case ig.Settings.InstanceNameCreating:
+		return provider.StateCreating, true
+	case ig.Settings.InstanceNameRunning:
+		return provider.StateRunning, true
+	case ig.Settings.InstanceNameRemoving:
+		return provider.StateDeleting, true
+	}
+
+	if matchesInstanceName(member.Name, ig.Settings.InstanceNameCreating, member.VMID) {
+		return provider.StateCreating, true
+	}
+
+	if matchesInstanceName(member.Name, ig.Settings.InstanceNameRunning, member.VMID) {
+		return provider.StateRunning, true
+	}
+
+	if matchesInstanceName(member.Name, ig.Settings.InstanceNameRemoving, member.VMID) {
+		return provider.StateDeleting, true
+	}
+
+	return "", false
+}
+
 func (ig *InstanceGroup) resolveInstanceState(ctx context.Context, member proxmox.ClusterResource) (provider.State, bool) {
 	if trackedState, ok := ig.getInstanceState(member.VMID); ok {
 		if trackedState == provider.StateRunning && member.Status == proxmox.StatusVirtualMachineStopped {
@@ -269,22 +382,18 @@ func (ig *InstanceGroup) resolveInstanceState(ctx context.Context, member proxmo
 		return trackedState, true
 	}
 
-	switch member.Name {
-	case ig.Settings.InstanceNameCreating:
-		return provider.StateCreating, true
-	case ig.Settings.InstanceNameRunning:
-		if member.Status == proxmox.StatusVirtualMachineStopped {
-			if ig.handleUnexpectedlyStoppedInstance(ctx, member) {
-				return provider.StateDeleting, true
-			}
-		}
-
-		return provider.StateRunning, true
-	case ig.Settings.InstanceNameRemoving:
-		return provider.StateDeleting, true
-	default:
+	state, ok := ig.matchInstanceStateByName(member)
+	if !ok {
 		return "", false
 	}
+
+	if state == provider.StateRunning && member.Status == proxmox.StatusVirtualMachineStopped {
+		if ig.handleUnexpectedlyStoppedInstance(ctx, member) {
+			return provider.StateDeleting, true
+		}
+	}
+
+	return state, true
 }
 
 func (ig *InstanceGroup) handleUnexpectedlyStoppedInstance(ctx context.Context, member proxmox.ClusterResource) bool {
@@ -293,11 +402,11 @@ func (ig *InstanceGroup) handleUnexpectedlyStoppedInstance(ctx context.Context, 
 		return false
 	}
 
-	ig.log.Warn("instance marked as running is stopped, marking for removal", "vmid", member.VMID, "node", member.Node)
+	ig.logWarn("instance marked as running is stopped, marking for removal", "vmid", member.VMID, "node", member.Node)
 	memberCopy := member
 
 	if markErr := ig.markInstancesForRemoval(ctx, &memberCopy); markErr != nil {
-		ig.log.Error("failed to mark stopped instance for removal", "vmid", member.VMID, "err", markErr)
+		ig.logError("failed to mark stopped instance for removal", "vmid", member.VMID, "err", markErr)
 	}
 
 	return true
@@ -308,7 +417,9 @@ func (ig *InstanceGroup) isInstanceCreating(member proxmox.ClusterResource) bool
 		return state == provider.StateCreating
 	}
 
-	return member.Name == ig.Settings.InstanceNameCreating
+	state, ok := ig.matchInstanceStateByName(member)
+
+	return ok && state == provider.StateCreating
 }
 
 func (ig *InstanceGroup) isInstanceDeleting(member proxmox.ClusterResource) bool {
@@ -316,7 +427,9 @@ func (ig *InstanceGroup) isInstanceDeleting(member proxmox.ClusterResource) bool
 		return state == provider.StateDeleting
 	}
 
-	return member.Name == ig.Settings.InstanceNameRemoving
+	state, ok := ig.matchInstanceStateByName(member)
+
+	return ok && state == provider.StateDeleting
 }
 
 func (ig *InstanceGroup) setInstanceState(vmid uint64, state provider.State) {
@@ -324,10 +437,17 @@ func (ig *InstanceGroup) setInstanceState(vmid uint64, state provider.State) {
 	defer ig.stateMu.Unlock()
 
 	if ig.instanceStates == nil {
-		ig.instanceStates = make(map[uint64]provider.State)
+		ig.instanceStates = make(map[uint64]trackedInstanceState)
 	}
 
-	ig.instanceStates[vmid] = state
+	ig.instanceStates[vmid] = trackedInstanceState{
+		state:     state,
+		updatedAt: time.Now(),
+	}
+
+	if state != provider.StateCreating && ig.staleCreatingSeen != nil {
+		delete(ig.staleCreatingSeen, vmid)
+	}
 }
 
 func (ig *InstanceGroup) getInstanceState(vmid uint64) (provider.State, bool) {
@@ -338,18 +458,73 @@ func (ig *InstanceGroup) getInstanceState(vmid uint64) (provider.State, bool) {
 		return "", false
 	}
 
-	state, ok := ig.instanceStates[vmid]
+	entry, ok := ig.instanceStates[vmid]
 
-	return state, ok
+	return entry.state, ok
+}
+
+func (ig *InstanceGroup) markActiveDeploy(vmid uint64) {
+	if vmid == 0 {
+		return
+	}
+
+	ig.stateMu.Lock()
+	defer ig.stateMu.Unlock()
+
+	if ig.activeDeploys == nil {
+		ig.activeDeploys = make(map[uint64]struct{})
+	}
+
+	ig.activeDeploys[vmid] = struct{}{}
+}
+
+func (ig *InstanceGroup) unmarkActiveDeploy(vmid uint64) {
+	if vmid == 0 {
+		return
+	}
+
+	ig.stateMu.Lock()
+	defer ig.stateMu.Unlock()
+
+	if ig.activeDeploys == nil {
+		return
+	}
+
+	delete(ig.activeDeploys, vmid)
+}
+
+func (ig *InstanceGroup) isActiveDeploy(vmid uint64) bool {
+	ig.stateMu.RLock()
+	defer ig.stateMu.RUnlock()
+
+	if ig.activeDeploys == nil {
+		return false
+	}
+
+	_, active := ig.activeDeploys[vmid]
+
+	return active
 }
 
 func (ig *InstanceGroup) cleanupDeletedInstanceStates(seenVMIDs map[uint64]struct{}) {
 	ig.stateMu.Lock()
 	defer ig.stateMu.Unlock()
 
-	for vmid, state := range ig.instanceStates {
-		if _, exists := seenVMIDs[vmid]; !exists && state == provider.StateDeleting {
-			delete(ig.instanceStates, vmid)
+	for vmid := range ig.instanceStates {
+		if _, exists := seenVMIDs[vmid]; exists {
+			continue
+		}
+
+		if _, active := ig.activeDeploys[vmid]; active {
+			continue
+		}
+
+		delete(ig.instanceStates, vmid)
+	}
+
+	for vmid := range ig.staleCreatingSeen {
+		if _, exists := seenVMIDs[vmid]; !exists {
+			delete(ig.staleCreatingSeen, vmid)
 		}
 	}
 }
@@ -396,4 +571,52 @@ func (ig *InstanceGroup) getInFlightClones(nodeName string) int {
 	}
 
 	return ig.inFlightNodeClones[nodeName]
+}
+
+func (ig *InstanceGroup) acquireCloneSlot(ctx context.Context) error {
+	if ig.cloneSem == nil {
+		return nil
+	}
+
+	select {
+	case ig.cloneSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (ig *InstanceGroup) releaseCloneSlot() {
+	if ig.cloneSem == nil {
+		return
+	}
+
+	select {
+	case <-ig.cloneSem:
+	default:
+	}
+}
+
+func (ig *InstanceGroup) logDebug(msg string, args ...any) {
+	if ig.log != nil {
+		ig.log.Debug(msg, args...)
+	}
+}
+
+func (ig *InstanceGroup) logInfo(msg string, args ...any) {
+	if ig.log != nil {
+		ig.log.Info(msg, args...)
+	}
+}
+
+func (ig *InstanceGroup) logWarn(msg string, args ...any) {
+	if ig.log != nil {
+		ig.log.Warn(msg, args...)
+	}
+}
+
+func (ig *InstanceGroup) logError(msg string, args ...any) {
+	if ig.log != nil {
+		ig.log.Error(msg, args...)
+	}
 }

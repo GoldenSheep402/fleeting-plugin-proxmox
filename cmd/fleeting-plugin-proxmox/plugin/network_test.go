@@ -204,6 +204,90 @@ func Test_determineAddresses(t *testing.T) {
 			expectedInternalAddress: "fd3b:47fc:de09::1",
 			expectedExternalAddress: "fd3b:47fc:de09::1",
 		},
+		{
+			name: "Auto interface skips virtual interfaces and picks first physical NIC",
+
+			requestedInterface: "auto",
+			requestedProtocol:  NetworkProtocolIPv4,
+			networkInterfaces: []*proxmox.AgentNetworkIface{
+				{
+					Name: "lo",
+					IPAddresses: []*proxmox.AgentNetworkIPAddress{
+						{IPAddressType: "ipv4", IPAddress: "127.0.0.1"},
+					},
+				},
+				{
+					Name: "docker0",
+					IPAddresses: []*proxmox.AgentNetworkIPAddress{
+						{IPAddressType: "ipv4", IPAddress: "172.17.0.1"},
+					},
+				},
+				{
+					Name: "br-123456",
+					IPAddresses: []*proxmox.AgentNetworkIPAddress{
+						{IPAddressType: "ipv4", IPAddress: "172.18.0.1"},
+					},
+				},
+				{
+					Name: "vethab12cd",
+					IPAddresses: []*proxmox.AgentNetworkIPAddress{
+						{IPAddressType: "ipv4", IPAddress: "10.244.0.5"},
+					},
+				},
+				{
+					Name: "enp1s0",
+					IPAddresses: []*proxmox.AgentNetworkIPAddress{
+						{IPAddressType: "ipv4", IPAddress: "192.168.10.42"},
+					},
+				},
+			},
+
+			expectedError:           nil,
+			expectedInternalAddress: "192.168.10.42",
+			expectedExternalAddress: "192.168.10.42",
+		},
+		{
+			name: "Comma separated fallback list picks first matching interface",
+
+			requestedInterface: "eth0, ens18, enp1s0",
+			requestedProtocol:  NetworkProtocolIPv4,
+			networkInterfaces: []*proxmox.AgentNetworkIface{
+				{
+					Name: "enp1s0",
+					IPAddresses: []*proxmox.AgentNetworkIPAddress{
+						{IPAddressType: "ipv4", IPAddress: "10.0.0.20"},
+					},
+				},
+				{
+					Name: "ens18",
+					IPAddresses: []*proxmox.AgentNetworkIPAddress{
+						{IPAddressType: "ipv4", IPAddress: "10.0.0.18"},
+					},
+				},
+			},
+
+			expectedError:           nil,
+			expectedInternalAddress: "10.0.0.18",
+			expectedExternalAddress: "10.0.0.18",
+		},
+		{
+			name: "Auto interface returns ErrNoIPAddress when only ignored interfaces exist",
+
+			requestedInterface: "auto",
+			requestedProtocol:  NetworkProtocolIPv4,
+			networkInterfaces: []*proxmox.AgentNetworkIface{
+				{
+					Name: "docker0",
+					IPAddresses: []*proxmox.AgentNetworkIPAddress{
+						{IPAddressType: "ipv4", IPAddress: "172.17.0.1"},
+					},
+				},
+			},
+
+			expectedError:           ErrNoIPAddress,
+			expectedInternalAddress: "",
+			expectedExternalAddress: "",
+		},
 	}
 
 	for _, testCase := range tests {
