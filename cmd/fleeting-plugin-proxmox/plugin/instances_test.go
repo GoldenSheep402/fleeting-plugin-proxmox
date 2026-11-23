@@ -385,3 +385,89 @@ func TestInstanceGroup_cloneTemplate_AsyncDuplicateVMIDRetriesWithoutDeleting(t 
 	require.Equal(t, provider.StateCreating, state119)
 	require.Equal(t, 1, ig.getInFlightClones("pve1"))
 }
+
+func TestInstanceGroup_MarkFailedVMForRemoval_SkipsForeignVMAndWaitFastFails(t *testing.T) {
+	ctx := context.Background()
+
+	var (
+		renamedVM117    atomic.Bool
+		collectionFired atomic.Bool
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, req *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch req.URL.Path {
+		case "/api2/json/nodes/ci/qemu/117/status/current":
+			_, _ = writer.Write([]byte(`{"data":{"vmid":117,"name":"gitlab-fleeting-running-117","status":"running"}}`))
+		case "/api2/json/nodes/ci/qemu/117/config":
+			if req.Method == http.MethodPost || req.Method == http.MethodPut {
+				renamedVM117.Store(true)
+			}
+			_, _ = writer.Write([]byte(`{"data":{"name":"gitlab-fleeting-running-117"}}`))
+		default:
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := proxmox.NewClient(server.URL + "/api2/json")
+	staleVM, err := (&proxmox.Node{}).New(client, "ci").VirtualMachine(ctx, 117)
+	require.NoError(t, err)
+
+	agentTimeout := 30
+	taskInterval := 1
+	ig := InstanceGroup{
+		proxmox:                   client,
+		instanceCollectionTrigger: make(chan struct{}, 1),
+		Settings: Settings{
+			InstanceNameCreating:     "gitlab-fleeting-win-creating",
+			InstanceNameRunning:      "gitlab-fleeting-win-running",
+			InstanceNameRemoving:     "gitlab-fleeting-win-removing",
+			InstanceNameIncludeVMID:  true,
+			ProxmoxAgentStartTimeout: &agentTimeout,
+			ProxmoxTaskWaitInterval:  &taskInterval,
+		},
+	}
+
+	ig.setInstanceState(117, provider.StateCreating)
+	ig.markFailedVMForRemoval(staleVM, 117)
+
+	// Foreign VM 117 ("gitlab-fleeting-running-117") must NOT be renamed or collected.
+	require.False(t, renamedVM117.Load())
+	select {
+	case <-ig.instanceCollectionTrigger:
+		collectionFired.Store(true)
+	default:
+	}
+	require.False(t, collectionFired.Load())
+	_, has117 := ig.getInstanceState(117)
+	require.False(t, has117)
+
+	// waitForInstanceReady must fail immediately on 404/does-not-exist instead of waiting agentStartTimeout (30s).
+	disappearedServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, req *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch req.URL.Path {
+		case "/api2/json/nodes/ci/qemu/999/status/current":
+			_, _ = writer.Write([]byte(`{"data":{"vmid":999,"name":"gitlab-fleeting-win-creating-999","status":"running"}}`))
+		case "/api2/json/nodes/ci/qemu/999/config":
+			_, _ = writer.Write([]byte(`{"data":{"name":"gitlab-fleeting-win-creating-999"}}`))
+		default:
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer disappearedServer.Close()
+
+	tlsCfg, err := ig.buildTLSConfig()
+	require.NoError(t, err)
+	disappearedClient, err := ig.buildProxmoxClientForURL(disappearedServer.URL, &proxmoxCredentials{TokenID: "t@pve!a", Secret: "s"}, tlsCfg)
+	require.NoError(t, err)
+
+	vm999, err := (&proxmox.Node{}).New(disappearedClient, "ci").VirtualMachine(ctx, 999)
+	require.NoError(t, err)
+
+	start := time.Now()
+	err = ig.waitForInstanceReady(ctx, vm999)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "disappeared while waiting for qemu agent")
+	require.Less(t, time.Since(start), 3*time.Second)
+}

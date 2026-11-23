@@ -179,12 +179,21 @@ func (ig *InstanceGroup) collectTimedOutCreatingMembers(
 func (ig *InstanceGroup) collectInstance(ctx context.Context, member proxmox.ClusterResource) {
 	vm, err := ig.getProxmoxVMOnNode(ctx, int(member.VMID), member.Node)
 	if err != nil {
-		if isVMNotFoundError(err) {
+		if isVMNotFoundError(err) || proxmox.IsNotAuthorized(err) {
+			ig.deleteInstanceState(member.VMID)
 			ig.logInfo("collector instance already removed", "vmid", member.VMID, "node", member.Node)
+
 			return
 		}
 
 		ig.logError("collector failed to fetch instance info", "vmid", member.VMID, "err", err)
+
+		return
+	}
+
+	if vm.Name != "" && !ig.ownsInstanceName(vm.Name, member.VMID) {
+		ig.logWarn("collector skipping recycled VMID owned by foreign name", "vmid", member.VMID, "name", vm.Name)
+		ig.deleteInstanceState(member.VMID)
 
 		return
 	}
@@ -201,7 +210,11 @@ func (ig *InstanceGroup) collectInstance(ctx context.Context, member proxmox.Clu
 			return waitForProxmoxTask(ctx, task, ig.taskWaitInterval(), timeout)
 		})
 		if err != nil {
+			if isVMNotFoundError(err) || proxmox.IsNotAuthorized(err) {
+				ig.deleteInstanceState(member.VMID)
+			}
 			ig.logCollectError("stop", member.VMID, err)
+
 			return
 		}
 	}
@@ -217,9 +230,16 @@ func (ig *InstanceGroup) collectInstance(ctx context.Context, member proxmox.Clu
 
 		return waitForProxmoxTask(ctx, task, ig.taskWaitInterval(), timeout)
 	})
-	if err != nil {
-		ig.logCollectError("delete", member.VMID, err)
+	if err == nil {
+		ig.deleteInstanceState(member.VMID)
+		return
 	}
+
+	if isVMNotFoundError(err) || proxmox.IsNotAuthorized(err) {
+		ig.deleteInstanceState(member.VMID)
+	}
+
+	ig.logCollectError("delete", member.VMID, err)
 }
 
 func (ig *InstanceGroup) logCollectError(action string, vmid uint64, err error) {

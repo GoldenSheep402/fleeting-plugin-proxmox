@@ -179,6 +179,10 @@ func (ig *InstanceGroup) waitForInstanceReady(ctx context.Context, vm *proxmox.V
 				return fmt.Errorf("not authorized to query qemu agent on instance vmid='%d': %w", vm.VMID, err)
 			}
 
+			if isVMNotFoundError(err) {
+				return fmt.Errorf("instance vmid='%d' disappeared while waiting for qemu agent: %w", vm.VMID, err)
+			}
+
 			lastErr = err
 		}
 
@@ -191,16 +195,36 @@ func (ig *InstanceGroup) waitForInstanceReady(ctx context.Context, vm *proxmox.V
 }
 
 func (ig *InstanceGroup) markFailedVMForRemoval(vm *proxmox.VirtualMachine, vmid int) {
-	ig.setInstanceState(uint64(vmid), provider.StateDeleting)
-
 	cleanupCtx, cancel := context.WithTimeout(ig.lifecycleContext(), ig.taskWaitTimeout())
 	defer cancel()
 
+	targetVM := vm
+	if ig.currentClient() != nil && vm != nil && vm.Node != "" {
+		liveVM, err := ig.getProxmoxVMOnNode(cleanupCtx, vmid, vm.Node)
+		if err != nil {
+			if isVMNotFoundError(err) || proxmox.IsNotAuthorized(err) {
+				ig.deleteInstanceState(uint64(vmid))
+				return
+			}
+		} else if liveVM != nil {
+			targetVM = liveVM
+		}
+	}
+
+	if targetVM != nil && targetVM.Name != "" && !ig.ownsInstanceName(targetVM.Name, uint64(vmid)) {
+		ig.logWarn("skipping removal of recycled VMID owned by foreign name", "vmid", vmid, "name", targetVM.Name)
+		ig.deleteInstanceState(uint64(vmid))
+
+		return
+	}
+
+	ig.setInstanceState(uint64(vmid), provider.StateDeleting)
+
 	removingName := ig.instanceNameForState(ig.Settings.InstanceNameRemoving, vmid)
 	applyRemovingTags := ig.Settings.InstanceTagsRemoving != "" || ig.Settings.InstanceTagsCreating != "" || ig.Settings.InstanceTagsRunning != ""
-	renameErr := ig.configureVMOptions(cleanupCtx, vm, removingName, ig.Settings.InstanceTagsRemoving, applyRemovingTags, nil, nil)
+	renameErr := ig.configureVMOptions(cleanupCtx, targetVM, removingName, ig.Settings.InstanceTagsRemoving, applyRemovingTags, nil, nil)
 
-	if renameErr != nil && !isVMNotFoundError(renameErr) {
+	if renameErr != nil && !isVMNotFoundError(renameErr) && !proxmox.IsNotAuthorized(renameErr) {
 		ig.logError("failed to rename failed instance for removal", "vmid", vmid, "err", renameErr)
 	}
 
@@ -463,14 +487,23 @@ func (ig *InstanceGroup) markInstancesForRemoval(ctx context.Context, instances 
 		errorGroup.Go(func() error {
 			vm, err := ig.getProxmoxVMOnNode(ctx, int(instance.VMID), instance.Node)
 			if err != nil {
-				if isVMNotFoundError(err) {
+				if isVMNotFoundError(err) || proxmox.IsNotAuthorized(err) {
+					ig.deleteInstanceState(instance.VMID)
 					ig.logInfo("Instance already removed from proxmox", "vmid", instance.VMID, "node", instance.Node)
+
 					return nil
 				}
 
 				ig.logError("Failed to mark instance for removal", "name", instance.Name, "vmid", instance.VMID, "node", instance.Node, "err", err)
 
 				return fmt.Errorf("failed to mark instance for removal: %w", err)
+			}
+
+			if vm.Name != "" && !ig.ownsInstanceName(vm.Name, instance.VMID) {
+				ig.logWarn("skipping mark-for-removal on recycled VMID owned by foreign name", "vmid", instance.VMID, "name", vm.Name)
+				ig.deleteInstanceState(instance.VMID)
+
+				return nil
 			}
 
 			removingName := ig.instanceNameForState(ig.Settings.InstanceNameRemoving, int(instance.VMID))

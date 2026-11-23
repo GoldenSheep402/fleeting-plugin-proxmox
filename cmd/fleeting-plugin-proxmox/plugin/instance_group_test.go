@@ -141,3 +141,35 @@ func TestInstanceGroup_ShutdownRespectsContextDeadline(t *testing.T) {
 	close(releaseWorker)
 	ig.collectorWaitGroup.Wait()
 }
+
+func TestInstanceGroup_ForeignNameIgnoresAndClearsStaleState(t *testing.T) {
+	ig := InstanceGroup{
+		Settings: Settings{
+			InstanceNameCreating:    "gitlab-fleeting-win-creating",
+			InstanceNameRunning:     "gitlab-fleeting-win-running",
+			InstanceNameRemoving:    "gitlab-fleeting-win-removing",
+			InstanceNameIncludeVMID: true,
+		},
+	}
+
+	// Stale deleting state left from a previous VMID 117 owned by this runner.
+	ig.setInstanceState(117, provider.StateDeleting)
+
+	// Pool member 117 is now owned by a different runner ("gitlab-fleeting-epyc-running-117").
+	foreignMember := proxmox.ClusterResource{
+		VMID:   117,
+		Name:   "gitlab-fleeting-epyc-running-117",
+		Status: proxmox.StatusVirtualMachineRunning,
+	}
+
+	require.False(t, ig.isInstanceDeleting(foreignMember))
+	require.False(t, ig.isInstanceCreating(foreignMember))
+
+	state, ok := ig.resolveInstanceState(context.Background(), foreignMember)
+	require.False(t, ok)
+	require.Empty(t, state)
+
+	// Stale tracked state must also have been cleared by resolveInstanceState.
+	_, stillTracked := ig.getInstanceState(117)
+	require.False(t, stillTracked)
+}

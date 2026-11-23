@@ -285,6 +285,10 @@ func (ig *InstanceGroup) Decrease(ctx context.Context, instancesToRemove []strin
 			continue
 		}
 
+		if member.Name != "" && !ig.ownsInstanceName(member.Name, member.VMID) {
+			continue
+		}
+
 		if ig.isInstanceCreating(member) {
 			// It must finish creation before starting deletion
 			continue
@@ -371,7 +375,28 @@ func (ig *InstanceGroup) matchInstanceStateByName(member proxmox.ClusterResource
 	return "", false
 }
 
+func (ig *InstanceGroup) ownsInstanceName(memberName string, vmid uint64) bool {
+	if ig.Settings.InstanceNameCreating == "" && ig.Settings.InstanceNameRunning == "" && ig.Settings.InstanceNameRemoving == "" {
+		return true
+	}
+
+	_, ok := ig.matchInstanceStateByName(proxmox.ClusterResource{
+		VMID: vmid,
+		Name: memberName,
+	})
+
+	return ok
+}
+
 func (ig *InstanceGroup) resolveInstanceState(ctx context.Context, member proxmox.ClusterResource) (provider.State, bool) {
+	if member.Name != "" && !ig.ownsInstanceName(member.Name, member.VMID) {
+		if !ig.isActiveDeploy(member.VMID) {
+			ig.deleteInstanceState(member.VMID)
+		}
+
+		return "", false
+	}
+
 	if trackedState, ok := ig.getInstanceState(member.VMID); ok {
 		if trackedState == provider.StateRunning && member.Status == proxmox.StatusVirtualMachineStopped {
 			if ig.handleUnexpectedlyStoppedInstance(ctx, member) {
@@ -413,6 +438,10 @@ func (ig *InstanceGroup) handleUnexpectedlyStoppedInstance(ctx context.Context, 
 }
 
 func (ig *InstanceGroup) isInstanceCreating(member proxmox.ClusterResource) bool {
+	if member.Name != "" && !ig.ownsInstanceName(member.Name, member.VMID) {
+		return false
+	}
+
 	if state, ok := ig.getInstanceState(member.VMID); ok {
 		return state == provider.StateCreating
 	}
@@ -423,6 +452,10 @@ func (ig *InstanceGroup) isInstanceCreating(member proxmox.ClusterResource) bool
 }
 
 func (ig *InstanceGroup) isInstanceDeleting(member proxmox.ClusterResource) bool {
+	if member.Name != "" && !ig.ownsInstanceName(member.Name, member.VMID) {
+		return false
+	}
+
 	if state, ok := ig.getInstanceState(member.VMID); ok {
 		return state == provider.StateDeleting
 	}

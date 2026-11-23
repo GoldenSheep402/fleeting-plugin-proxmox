@@ -70,6 +70,72 @@ func TestCollector_CollectInstance_PausedAndNotFound(t *testing.T) {
 	ig.collectInstance(ctx, proxmox.ClusterResource{VMID: 404, Node: "pve1", Name: "fleeting-removing"})
 }
 
+func TestCollector_CollectInstance_ClearsStateAndSkipsForeignVM(t *testing.T) {
+	ctx := context.Background()
+
+	var (
+		touchedForeign117 atomic.Bool
+		deletedOwn118     atomic.Bool
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, req *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch req.URL.Path {
+		case "/api2/json/nodes/pve1/qemu/117/status/current":
+			_, _ = writer.Write([]byte(`{"data":{"vmid":117,"name":"gitlab-fleeting-epyc-running-117","status":"running"}}`))
+		case "/api2/json/nodes/pve1/qemu/117/config":
+			_, _ = writer.Write([]byte(`{"data":{"name":"gitlab-fleeting-epyc-running-117"}}`))
+		case "/api2/json/nodes/pve1/qemu/117/status/stop",
+			"/api2/json/nodes/pve1/qemu/117":
+			touchedForeign117.Store(true)
+			writer.WriteHeader(http.StatusInternalServerError)
+		case "/api2/json/nodes/pve1/qemu/118/status/current":
+			_, _ = writer.Write([]byte(`{"data":{"vmid":118,"name":"gitlab-fleeting-win-removing-118","status":"stopped"}}`))
+		case "/api2/json/nodes/pve1/qemu/118/config":
+			_, _ = writer.Write([]byte(`{"data":{"name":"gitlab-fleeting-win-removing-118"}}`))
+		case "/api2/json/nodes/pve1/qemu/118":
+			if req.Method == http.MethodDelete {
+				deletedOwn118.Store(true)
+				_, _ = writer.Write([]byte(`{"data":"UPID:pve1:00001234:00005678:65000002:qmdestroy:118:root@pam:"}`))
+				return
+			}
+			writer.WriteHeader(http.StatusNotFound)
+		case "/api2/json/nodes/pve1/tasks/UPID:pve1:00001234:00005678:65000002:qmdestroy:118:root@pam:/status":
+			_, _ = writer.Write([]byte(`{"data":{"status":"stopped","exitstatus":"OK"}}`))
+		default:
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	taskInterval := 1
+	ig := InstanceGroup{
+		proxmox: proxmox.NewClient(server.URL + "/api2/json"),
+		Settings: Settings{
+			InstanceNameCreating:    "gitlab-fleeting-win-creating",
+			InstanceNameRunning:     "gitlab-fleeting-win-running",
+			InstanceNameRemoving:    "gitlab-fleeting-win-removing",
+			InstanceNameIncludeVMID: true,
+			ProxmoxTaskWaitInterval: &taskInterval,
+		},
+	}
+
+	ig.setInstanceState(117, provider.StateDeleting)
+	ig.setInstanceState(118, provider.StateDeleting)
+
+	// Foreign VM 117 must NOT be stopped or deleted, and stale state must be cleared.
+	ig.collectInstance(ctx, proxmox.ClusterResource{VMID: 117, Node: "pve1", Name: "gitlab-fleeting-win-removing-117"})
+	require.False(t, touchedForeign117.Load())
+	_, has117 := ig.getInstanceState(117)
+	require.False(t, has117)
+
+	// Owned VM 118 must be deleted AND its state cleared immediately upon deletion.
+	ig.collectInstance(ctx, proxmox.ClusterResource{VMID: 118, Node: "pve1", Name: "gitlab-fleeting-win-removing-118"})
+	require.True(t, deletedOwn118.Load())
+	_, has118 := ig.getInstanceState(118)
+	require.False(t, has118)
+}
+
 func TestCollector_ReapOrphanedCreatingInstances(t *testing.T) {
 	ctx := context.Background()
 
